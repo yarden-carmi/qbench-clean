@@ -35,9 +35,9 @@ SIGNATURES: dict[str, str] = {
 #: sum/amax along a dim, abs, clamp): the IPU's own functions and its store.
 PRIMITIVES: dict[str, Any] = {
     "store": lambda t, dim=-1: _q(t) if dim == -1 else (approx._qf(t, approx.precision(), dim)),
-    "exp2": lambda t: _exact32(torch.exp2, t),
-    "reciprocal": lambda t: _exact32(torch.reciprocal, t),
-    "rsqrt": lambda t: _exact32(torch.rsqrt, t),
+    "exp2": lambda t: _exact32(torch.exp2, torch.as_tensor(t, dtype=torch.float32)),
+    "reciprocal": lambda t: _exact32(torch.reciprocal, torch.as_tensor(t, dtype=torch.float32)),
+    "rsqrt": lambda t: _exact32(torch.rsqrt, torch.as_tensor(t, dtype=torch.float32)),
     "relu": F.relu,
     "relu6": F.relu6,
     "lut": lut,                      # lut(fn, lo, hi, r=8.0, entries=256, interpolate=True) -> callable
@@ -121,6 +121,15 @@ def op_error(op: str, fn, precision: str | None = None) -> dict[str, float]:
     finally:
         approx.PRECISION.reset(token)
     ref = exact_fn(op)(*args, **kw)
+    if got is None:
+        raise ValueError("the candidate returned None")
+    if precision is not None and op not in ("topk",):
+        # the chip always writes the result to memory: one store, whatever the candidate did
+        dim = args[1] if op == "softmax" else -1
+        if op == "layernorm":
+            got = (approx._qf(got[0], precision), *got[1:])
+        else:
+            got = approx._qf(torch.as_tensor(got, dtype=torch.float32), precision, dim)
     if op == "topk":
         gv, gi = got
         rv, ri = ref
