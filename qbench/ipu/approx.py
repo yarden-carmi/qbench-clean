@@ -200,11 +200,22 @@ def softmax_exp2(x: torch.Tensor, dim: int, fmt: str | None = "e4") -> torch.Ten
 
     With ``fmt`` every stored stage is NX8 along ``dim`` (the hardware store);
     ``None`` is the FP32 emulator path.
+
+    Masked positions (an attention mask's ``-inf`` or ``finfo.min``, anything at or below
+    -1e30) are inactive lanes, as a kernel masks them with ``R_MASK`` / the DS valid
+    count: they hold 0 in every stored row, so they never set a row's scale, and their
+    probability is 0. Storing them as values would let -3e38 set the scale and flush
+    every real score in the row.
     """
     q = (lambda t: quantize(t, fmt, dim)) if fmt else (lambda t: t)
     xf = x.float()
-    z = q((xf - xf.amax(dim, keepdim=True)) * LOG2E)
-    e = q(torch.exp2(z))
+    masked = xf <= -1e30
+    zero = torch.zeros_like(xf)
+    live = torch.where(masked, torch.full_like(xf, -torch.inf), xf)
+    m = live.amax(dim, keepdim=True)
+    m = torch.where(torch.isfinite(m), m, zero.sum(dim, keepdim=True))   # an all-masked row
+    z = q(torch.where(masked, zero, (xf - m) * LOG2E))
+    e = q(torch.where(masked, zero, torch.exp2(z)))
     s = e.sum(dim, keepdim=True)
     r = torch.reciprocal(s)        # one value per row: a MULT constant, FP32 in R_ACC
     return q(e * r).to(x.dtype)

@@ -161,3 +161,28 @@ def test_exp2_sigmoid_is_row_stable():
     assert float(y[0, 0]) < 1e-6
     for op, m in [("silu", "exp2_recip"), ("gelu_tanh", "exp2_recip"), ("sigmoid", "exp2_recip")]:
         assert approx.op_error(approx.get(op, m))["sqnr_db"] > 20
+
+
+def test_inf_matches_emulator_and_nan_raises():
+    nx8 = _ipu_isa()
+    for fe in (2, 4, 5):
+        fmt = nx8.Nx8Format(sign=1, exp_format=fe, num_bits=8)
+        x = _rows(5)
+        x[0, 3], x[1, 9], x[2, 0] = float("inf"), float("-inf"), float("inf")
+        got = quantize(x, Nx8(fe=fe))
+        for r in range(x.shape[0]):
+            enc = nx8.encode_row([float(v) for v in x[r]], fmt)
+            assert got[r].tolist() == nx8.decode_row(enc.elements, fmt, enc.scale, enc.dynamic_exponent), (fe, r)
+    with pytest.raises(ValueError):
+        quantize(torch.tensor([float("nan")]), "e4")
+
+
+def test_masked_softmax_rows():
+    x = torch.randn(3, 256)
+    x[:, 100:] = torch.finfo(torch.float32).min      # a causal-style mask
+    x[1, 50:] = float("-inf")
+    for fmt in ("e4", "dynamic"):
+        y = approx.get("softmax", f"exp2_nx8_{fmt}").fn(x, -1)
+        ref = torch.softmax(x, -1)
+        assert y[:, 100:].abs().max() < 1e-30   # an all-zero NX8 row decodes as 2^-127, as in the emulator
+        assert (y - ref).abs().max() < 0.05

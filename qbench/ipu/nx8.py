@@ -5,8 +5,9 @@ per-row ``e8m0`` scale: the largest FP32 exponent field of the row. Each element
 stores its exponent as a *distance below* that scale; ``fe`` exponent bits and
 ``fm`` mantissa bits. This module reproduces ``ipu_isa.nx8.encode_row`` followed
 by ``decode_row`` (value in, value out) with integer arithmetic on the FP32 bit
-fields, so it is bit-exact with the emulator for static formats
-(``tests/test_ipu_nx8.py`` checks it against ``ipu_isa`` when that is importable).
+fields, so it is bit-exact with the emulator on finite inputs and ±inf (saturated, left out of the
+row scale) for the formats ``tests/test_ipu_approx.py`` checks against ``ipu_isa``:
+signed 8-bit e1-e7 and three unsigned/narrow types. NaN raises, as in the emulator.
 
 ``dynamic`` rows choose fe = 1 or 2 with the spec's score (§4.3.2.3), evaluated
 here in float64 instead of exact fractions: it can differ from the emulator on
@@ -130,17 +131,29 @@ def quantize(x: torch.Tensor, fmt: Nx8 | str = "e4", dim: int = -1) -> torch.Ten
     if pad:
         flat = torch.nn.functional.pad(flat, (0, pad))
     rows = flat.reshape(-1, ROW)
-    finite = torch.isfinite(rows)
-    rows = torch.where(finite, rows, torch.sign(rows) * torch.finfo(torch.float32).max)
-    sign, exp, sig = _fields(rows)
+    if torch.isnan(rows).any():
+        raise ValueError("NX8 has no NaN encoding (OQ-37)")
+    inf = torch.isinf(rows)
+    sign, exp, sig = _fields(torch.where(inf, torch.zeros_like(rows), rows))
+    sign = torch.where(inf, (rows < 0).to(sign.dtype), sign)
+    # the scale is the largest exponent of the finite elements (±inf is left out, as the
+    # emulator does); padding elements are 0 (exponent 0) and never raise it
     scale = exp.amax(-1, keepdim=True)
-    # padding elements must not raise the scale (they are 0 → exp 0, harmless)
     if fmt.dynamic:
         choice = _dynamic_choice(exp, sig, scale)
         q1 = _quant_rows(sign, exp, sig, scale, 1, 6, 1)
         q2 = _quant_rows(sign, exp, sig, scale, 2, 5, 1)
         q = torch.where(choice.bool(), q2, q1)
+        fm_row = torch.where(choice.bool(), 5, 6)
     else:
         q = _quant_rows(sign, exp, sig, scale, fmt.fe, fmt.fm(), fmt.sign)
+        fm_row = torch.full_like(scale, fmt.fm())
+    if inf.any():
+        # ±inf saturates to the row's largest magnitude: exponent field 0, mantissa all ones
+        top = torch.ldexp(2.0 - torch.ldexp(torch.ones_like(scale, dtype=torch.float64), -fm_row.double()),
+                          (scale - 127).double())
+        neg_to_zero = not fmt.sign
+        sat = torch.where(sign.bool(), torch.zeros_like(q) if neg_to_zero else -top, top).expand_as(q)
+        q = torch.where(inf, sat, q)
     q = q.reshape(flat.shape)[:, :n].reshape(shape)
     return q.movedim(-1, dim).to(orig_dtype)
