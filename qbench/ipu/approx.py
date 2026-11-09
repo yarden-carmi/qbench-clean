@@ -23,6 +23,7 @@ pessimistic case).
 
 from __future__ import annotations
 
+import contextvars
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -105,8 +106,26 @@ ones = torch.ones_like
 neg_ones = lambda x: -torch.ones_like(x)  # noqa: E731
 
 
-def _q(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
-    return quantize(x, fmt)
+#: The numeric regime a method runs in: None = FP32 (only the method's own algorithm
+#: differs from exact), or an NX8 type ("e4", "e5", "dynamic") = every store the chip
+#: makes is rounded to it. ApproxSimulator sets it for a run; methods that name a format
+#: in their name (``exp2_nx8_e4``) ignore it.
+PRECISION: contextvars.ContextVar[str | None] = contextvars.ContextVar("ipu_precision", default=None)
+
+
+def precision() -> str | None:
+    return PRECISION.get()
+
+
+_CTX = object()
+
+
+def _q(x: torch.Tensor, fmt: object = _CTX) -> torch.Tensor:
+    """A store: NX8 in the run's precision (or ``fmt``), unchanged in FP32."""
+    f = precision() if fmt is _CTX else fmt
+    if f is None or f == "fp32":
+        return x
+    return quantize(x, f)
 
 
 #: log2(e) as the kernels hold it: two MULT constants NX8 holds exactly (rel. error 4.9e-6).
@@ -149,7 +168,7 @@ def silu_kernel(x: torch.Tensor, fmt: str | None = "e4") -> torch.Tensor:
     return _qf(torch.maximum(x * r, q * r), fmt)
 
 
-def _exp2_recip_sigmoid(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
+def _exp2_recip_sigmoid(x: torch.Tensor, fmt: object = _CTX) -> torch.Tensor:
     """sigmoid via exp2 and reciprocal, each stored stage NX8, in the stable form.
 
     e = exp2(-|x| log2e) is in (0, 1], so one row's values share a sane scale; the
@@ -158,8 +177,10 @@ def _exp2_recip_sigmoid(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
     x >= 0, e r for x < 0. This is the dataflow of kernels/zoo/silu_exp2_recip.
     """
     t = _q(x.abs(), fmt)
-    e = _q(torch.exp2(-t * LOG2E), fmt)
-    r = _q(torch.reciprocal(1.0 + e), fmt)
+    a = -(t * LOG2E_HI)
+    a = a - t * LOG2E_LO
+    e = _q(_exact32(torch.exp2, a), fmt)
+    r = _q(_exact32(torch.reciprocal, 1.0 + e), fmt)
     return torch.where(x >= 0, r, _q(e * r, fmt))
 
 
@@ -193,9 +214,10 @@ register(Method("gelu_tanh", "erf", "variation", _gelu, "the erf GELU in place o
                 hw="LUT"))
 register(Method("gelu_tanh", "sigmoid1702", "estimation", lambda x: x * torch.sigmoid(1.702 * x),
                 "x*sigmoid(1.702x) in place of tanh GELU", hw="exp2 + reciprocal + MULT"))
-register(Method("silu", "exp2_recip", "approximation", lambda x, fmt="e4": silu_kernel(x, fmt),
+register(Method("silu", "exp2_recip", "approximation",
+                lambda x, fmt=_CTX: silu_kernel(x, precision() if fmt is _CTX else fmt),
                 "kernels/zoo/silu_exp2_recip's dataflow: |x|, exp2(-|x| log2e), 1/(1+e), max(x r, x e r); "
-                "every store NX8 e4", hw="MULT + ACTIVATE.QUANTIZE exp2 + ACTIVATE.QUANTIZE reciprocal"))
+                "every store in the run's precision", hw="MULT + ACTIVATE.QUANTIZE exp2 + ACTIVATE.QUANTIZE reciprocal"))
 for _f in ("e5", "dynamic"):
     register(Method("silu", f"exp2_recip_{_f}", "approximation", lambda x, _f=_f: silu_kernel(x, _f),
                     f"as exp2_recip, every store NX8 {_f}",
@@ -203,29 +225,29 @@ for _f in ("e5", "dynamic"):
 register(Method("silu", "hardswish", "estimation", F.hardswish, "x*relu6(x+3)/6 in place of SiLU",
                 hw="ACTIVATE.QUANTIZE relu6 + MULT"))
 register(Method("sigmoid", "exp2_recip", "approximation", _exp2_recip_sigmoid,
-                "reciprocal(1 + exp2(-x log2e)), NX8 e4 between stages",
+                "reciprocal(1 + exp2(-|x| log2e)), stable form, stores in the run's precision",
                 hw="ACTIVATE.QUANTIZE exp2 + reciprocal"))
 register(Method("sigmoid", "hardsigmoid", "estimation", F.hardsigmoid, "relu6(x+3)/6 in place of sigmoid",
                 hw="ACTIVATE.QUANTIZE relu6"))
 register(Method("tanh", "via_sigmoid", "approximation", lambda x: 2 * _exp2_recip_sigmoid(2 * x) - 1,
-                "2 sigmoid(2x) - 1 (an identity) via exp2 + reciprocal, NX8 e4 between stages",
+                "2 sigmoid(2x) - 1 (an identity) via exp2 + reciprocal, stores in the run's precision",
                 hw="ACTIVATE.QUANTIZE exp2 + reciprocal"))
 
 
-def _gelu_tanh_exp2(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
+def _gelu_tanh_exp2(x: torch.Tensor, fmt: object = _CTX) -> torch.Tensor:
     # 0.5x(1 + tanh(z)) = x * sigmoid(2z), z = sqrt(2/pi)(x + 0.044715 x^3)
     z = math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)
     return x * _exp2_recip_sigmoid(_q(2.0 * z, fmt), fmt)
 
 
 register(Method("gelu_tanh", "exp2_recip", "approximation", _gelu_tanh_exp2,
-                "x * sigmoid(2 sqrt(2/pi)(x + 0.044715x^3)) via exp2 + reciprocal, NX8 e4 between stages",
+                "x * sigmoid(2 sqrt(2/pi)(x + 0.044715x^3)) via exp2 + reciprocal, stores in the run's precision",
                 hw="MULT (cubic) + ACTIVATE.QUANTIZE exp2 + reciprocal"))
 register(Method("gelu", "tanh_exp2", "estimation", _gelu_tanh_exp2,
-                "the tanh form of GELU, computed via exp2 + reciprocal with NX8 e4 stages",
+                "the tanh form of GELU via exp2 + reciprocal, stores in the run's precision",
                 hw="MULT (cubic) + ACTIVATE.QUANTIZE exp2 + reciprocal"))
 register(Method("gelu", "sigmoid1702_exp2", "estimation", lambda x: x * _exp2_recip_sigmoid(1.702 * x),
-                "x*sigmoid(1.702x) via exp2 + reciprocal, NX8 e4 stages", hw="MULT + exp2 + reciprocal"))
+                "x*sigmoid(1.702x) via exp2 + reciprocal, stores in the run's precision", hw="MULT + exp2 + reciprocal"))
 register(Method("quick_gelu", "exp2_recip", "approximation", lambda x: x * _exp2_recip_sigmoid(1.702 * x),
                 "x*sigmoid(1.702x) via exp2 + reciprocal, NX8 e4 stages", hw="MULT + exp2 + reciprocal"))
 for op, f in [("relu", F.relu), ("relu6", F.relu6), ("hardswish", F.hardswish),
@@ -274,6 +296,9 @@ def softmax_exp2(x: torch.Tensor, dim: int, fmt: str | None = "e4") -> torch.Ten
 
 register(Method("softmax", "exact", "exact", _softmax_exact, "torch.softmax, FP32",
                 hw="ACTIVATE.EXACT exp2/reciprocal (emulator only)", on_chip=False))
+register(Method("softmax", "exp2", "approximation", lambda x, dim: softmax_exp2(x, dim, precision()),
+                "kernels/zoo/softmax_exp2_nx8_e4's dataflow, stores in the run's precision (exact in FP32)",
+                hw="AGG.MAX, MULT, ACTIVATE.QUANTIZE exp2, AGG.SUM, ACTIVATE.QUANTIZE reciprocal"))
 register(Method("softmax", "exp2_fp32", "exact", lambda x, dim: softmax_exp2(x, dim, None),
                 "exp2(x log2e) recipe in FP32 (the emulator kernels)", on_chip=False,
                 hw="AGG.MAX, MULT, ACTIVATE.EXACT exp2, AGG.SUM, ACTIVATE.EXACT reciprocal"))
@@ -310,6 +335,12 @@ register(Method("layernorm", "exact", "exact", lambda *a: layernorm(*a), "aten l
 register(Method("layernorm", "no_eps", "variation", lambda *a: layernorm(*a, use_eps=False),
                 "no eps (the emulator kernels, Q57); rsqrt(0) = 0", on_chip=False,
                 hw="MULT/ACC mean+var, ACTIVATE.EXACT rsqrt"))
+register(Method("layernorm", "rsqrt", "approximation", lambda *a: layernorm(*a, fmt=precision()),
+                "mean/var in FP32, rsqrt and output stored in the run's precision", hw="ACTIVATE.QUANTIZE rsqrt"))
+register(Method("layernorm", "rsqrt_no_eps", "variation",
+                lambda *a: layernorm(*a, use_eps=False, fmt=precision()),
+                "as the emulator kernels: no eps, rsqrt(0) = 0; stores in the run's precision",
+                hw="ACTIVATE.QUANTIZE rsqrt"))
 register(Method("layernorm", "rsqrt_nx8", "approximation", lambda *a: layernorm(*a, fmt="e4"),
                 "rsqrt and output stored NX8 e4", hw="ACTIVATE.QUANTIZE rsqrt"))
 register(Method("rsqrt", "exact", "exact", torch.rsqrt, "torch.rsqrt", hw="ACTIVATE.QUANTIZE rsqrt"))
@@ -403,3 +434,73 @@ ISA_SUPPORT: dict[str, tuple[str, str]] = {
     "mish": ("none", "no log/softplus: generic LUT"), "softplus": ("none", "no log: generic LUT"),
     "elu": ("composed", "exp2 for x < 0, select by mask"),
 }
+
+
+# --------------------------------------------------------------------------- substitutes for ops with no instruction
+# Each takes the op's own arguments and returns what the op returns; stores follow the run's precision.
+
+def topk_iterative_max(x: torch.Tensor, k: int, dim: int = -1, largest: bool = True,
+                       sorted: bool = True) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: A002
+    """top-k as k passes of (AGG.MAX, mask the winner out): what the IPU can do.
+
+    The scores are the stored row (the run's precision), so in NX8 two experts whose
+    logits round to the same value tie, and the lower index wins (AGG.MAX keeps the first).
+    """
+    s = _q(x.float().movedim(dim, -1))
+    s = s if largest else -s
+    vals, idx = [], []
+    work = s.clone()
+    for _ in range(k):
+        i = work.argmax(-1, keepdim=True)          # first maximum: lowest index on ties
+        vals.append(s.gather(-1, i))
+        idx.append(i)
+        work = work.scatter(-1, i, float("-inf"))
+    v = torch.cat(vals, -1)
+    v = v if largest else -v
+    return v.movedim(-1, dim).to(x.dtype), torch.cat(idx, -1).movedim(-1, dim)
+
+
+def topk_exact(x, k, dim=-1, largest=True, sorted=True):  # noqa: A002
+    return torch.topk(x, k, dim, largest, sorted)
+
+
+register(Method("topk", "exact", "exact", topk_exact, "torch.topk (host)", hw="none: host", on_chip=False))
+register(Method("topk", "iterative_max", "variation", topk_iterative_max,
+                "k passes of max + mask on the stored scores (ties: lowest index)",
+                hw="AGG.MAX + R_MASK, k passes"))
+
+
+def div_recip_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """a / b as a * reciprocal(b): the reciprocal is stored (the run's precision)."""
+    return a * _q(_exact32(torch.reciprocal, b.float())).to(a.dtype)
+
+
+register(Method("div", "exact", "exact", torch.div, "a / b", hw="none: no divide", on_chip=False))
+register(Method("div", "recip_mul", "approximation", div_recip_mul, "a * reciprocal(b), reciprocal stored",
+                hw="ACTIVATE.QUANTIZE reciprocal + MULT"))
+
+register(Method("cos", "exact", "exact", torch.cos, "torch.cos", hw="none", on_chip=False))
+register(Method("cos", "host_table", "variation", lambda x: _q(torch.cos(x)),
+                "computed on the host once (RoPE tables depend only on positions), stored in the run's precision",
+                hw="host-precomputed table in XMEM"))
+register(Method("sin", "exact", "exact", torch.sin, "torch.sin", hw="none", on_chip=False))
+register(Method("sin", "host_table", "variation", lambda x: _q(torch.sin(x)),
+                "computed on the host once (RoPE tables), stored in the run's precision",
+                hw="host-precomputed table in XMEM"))
+
+#: erf(y) = 2 Phi(sqrt2 y) - 1 ~ tanh(A y + B y^3), from GELU's tanh form.
+ERF_A = math.sqrt(2.0 / math.pi) * math.sqrt(2.0)                    # 1.12838
+ERF_B = math.sqrt(2.0 / math.pi) * 0.044715 * 2.0 * math.sqrt(2.0)   # 0.10091
+register(Method("erf", "exact", "exact", torch.erf, "torch.erf", hw="none", on_chip=False))
+register(Method("erf", "tanh_cubic", "estimation",
+                lambda x: 2 * _exp2_recip_sigmoid(2 * (ERF_A * x + ERF_B * x ** 3)) - 1,
+                "erf(y) ~ tanh(1.1284 y + 0.1009 y^3) (GELU's tanh form) via exp2 + reciprocal",
+                hw="MULT + ACTIVATE.QUANTIZE exp2 + reciprocal"))
+
+ISA_SUPPORT.update({
+    "topk": ("none", "no sort/top-k: k passes of AGG.MAX + R_MASK"),
+    "div": ("none", "no divide: a * reciprocal(b)"),
+    "cos": ("none", "no trig: host-precomputed table"),
+    "sin": ("none", "no trig: host-precomputed table"),
+    "erf": ("none", "no erf: tanh form via exp2 + reciprocal"),
+})

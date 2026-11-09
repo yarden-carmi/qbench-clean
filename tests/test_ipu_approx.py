@@ -186,3 +186,31 @@ def test_masked_softmax_rows():
         ref = torch.softmax(x, -1)
         assert y[:, 100:].abs().max() < 1e-30   # an all-zero NX8 row decodes as 2^-127, as in the emulator
         assert (y - ref).abs().max() < 0.05
+
+
+def test_precision_regimes():
+    torch.manual_seed(0)
+    model = _Tiny().eval()
+    scen = Scenario("s", (torch.randn(4, 16),))
+    ref = model(*scen.args)
+    # FP32 with no substitutes is the model
+    assert torch.allclose(ApproxSimulator(model, {}).run(scen), ref, atol=1e-6)
+    # NX8 baseline rounds even with no substitutes
+    base = ApproxSimulator(model, {}, precision="e4")
+    yq = base.run(scen)
+    assert not torch.equal(yq, ref) and base.hits["matmul"] == 2
+    # the substitute runs in the regime's precision
+    s32 = ApproxSimulator(model, {"gelu": "tanh_exp2"}).run(scen)
+    s8 = ApproxSimulator(model, {"gelu": "tanh_exp2"}, precision="e4").run(scen)
+    assert not torch.equal(s32, s8)
+    assert approx.PRECISION.get() is None   # reset after the run
+
+
+def test_topk_substitute_routes():
+    class M(nn.Module):
+        def forward(self, x):
+            v, i = torch.topk(torch.softmax(x, -1), 2, dim=-1)
+            return v * i
+    x = torch.randn(8, 16)
+    sim = ApproxSimulator(M(), {"topk": "iterative_max"})
+    assert torch.equal(sim.run(Scenario("s", (x,))), M()(x)) and sim.hits["topk"] == 1
