@@ -90,7 +90,7 @@ class HFProvider:
 
 def _wikitext_text() -> str:
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     return "\n".join(t for t in ds["text"] if t.strip())
 
 

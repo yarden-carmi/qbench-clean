@@ -110,9 +110,17 @@ def _q(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
 
 
 def _exp2_recip_sigmoid(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
-    # sigmoid(x) = reciprocal(1 + exp2(-x * log2 e)), each stage stored as NX8
-    e = _q(torch.exp2(_q(-x * LOG2E, fmt)), fmt)
-    return _q(torch.reciprocal(1.0 + e), fmt)
+    """sigmoid via exp2 and reciprocal, each stored stage NX8, in the stable form.
+
+    e = exp2(-|x| log2e) is in (0, 1], so one row's values share a sane scale; the
+    naive exp2(-x log2e) mixes huge and tiny values in a row and the row scale flushes
+    the tiny ones (sigmoid(0.02) -> 1). r = 1/(1+e) = sigmoid(|x|); sigmoid(x) = r for
+    x >= 0, e r for x < 0. This is the dataflow of kernels/zoo/silu_exp2_recip.
+    """
+    t = _q(x.abs(), fmt)
+    e = _q(torch.exp2(-t * LOG2E), fmt)
+    r = _q(torch.reciprocal(1.0 + e), fmt)
+    return torch.where(x >= 0, r, _q(e * r, fmt))
 
 
 # --------------------------------------------------------------------------- activations

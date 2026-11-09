@@ -148,3 +148,16 @@ def test_evaluate_with_qbench():
     rep = evaluate(model, sim, provider, EvaluationConfig(metrics="fast")).to_dict()
     flat = str(rep)
     assert "sqnr" in flat and "cosine" in flat
+
+
+def test_exp2_sigmoid_is_row_stable():
+    # one row mixing large negative and small inputs: the naive exp2(-x log2e) form
+    # flushes the small ones (sigmoid(0.02) -> 1); the stable form must not
+    x = torch.zeros(1, 128)
+    x[0, 0] = -40.0
+    x[0, 1] = 0.02
+    y = approx.get("sigmoid", "exp2_recip").fn(x)
+    assert abs(float(y[0, 1]) - 0.505) < 0.02
+    assert float(y[0, 0]) < 1e-6
+    for op, m in [("silu", "exp2_recip"), ("gelu_tanh", "exp2_recip"), ("sigmoid", "exp2_recip")]:
+        assert approx.op_error(approx.get(op, m))["sqnr_db"] > 20
