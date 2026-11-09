@@ -109,6 +109,46 @@ def _q(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
     return quantize(x, fmt)
 
 
+#: log2(e) as the kernels hold it: two MULT constants NX8 holds exactly (rel. error 4.9e-6).
+LOG2E_HI, LOG2E_LO = 1.4375, 0.00518798828125
+
+
+def _qf(x: torch.Tensor, fmt: str | None, dim: int = -1) -> torch.Tensor:
+    """An ACTIVATE.QUANTIZE store: NX8 rows along ``dim``, or FP32 rounding (fmt None / fp32)."""
+    if fmt is None or fmt == "fp32":
+        return x.float()
+    return quantize(x.float(), fmt, dim)
+
+
+def _exact32(fn, x: torch.Tensor) -> torch.Tensor:
+    """An AaQ function as the emulator evaluates it: exact math, then one rounding to FP32."""
+    return fn(x.double()).float()
+
+
+def _q_alone(x: torch.Tensor, fmt: str | None) -> torch.Tensor:
+    """A value stored alone in its row (its own scale): rounded to fm + 1 significant bits."""
+    if fmt is None or fmt == "fp32":
+        return x.float()
+    return quantize(x.float().reshape(-1, 1), fmt, -1).reshape(x.shape)
+
+
+def silu_kernel(x: torch.Tensor, fmt: str | None = "e4") -> torch.Tensor:
+    """SiLU exactly as kernels/zoo/silu_exp2_recip computes it, store by store.
+
+    t = |x| (max(-x, x), stored); a = -(t hi) - (t lo) in the FP32 accumulator;
+    e = exp2(a) stored; r = reciprocal(1 + e) stored (= sigmoid(|x|));
+    q = x e stored; y = max(x r, q r) stored (x >= 0: x r; x < 0: x e r).
+    """
+    x = x.float()
+    t = _qf(torch.maximum(-x, x), fmt)
+    a = -(t * LOG2E_HI)
+    a = a - t * LOG2E_LO
+    e = _qf(_exact32(torch.exp2, a), fmt)
+    r = _qf(_exact32(torch.reciprocal, 1.0 + e), fmt)
+    q = _qf(x * e, fmt)
+    return _qf(torch.maximum(x * r, q * r), fmt)
+
+
 def _exp2_recip_sigmoid(x: torch.Tensor, fmt: str = "e4") -> torch.Tensor:
     """sigmoid via exp2 and reciprocal, each stored stage NX8, in the stable form.
 
@@ -153,9 +193,13 @@ register(Method("gelu_tanh", "erf", "variation", _gelu, "the erf GELU in place o
                 hw="LUT"))
 register(Method("gelu_tanh", "sigmoid1702", "estimation", lambda x: x * torch.sigmoid(1.702 * x),
                 "x*sigmoid(1.702x) in place of tanh GELU", hw="exp2 + reciprocal + MULT"))
-register(Method("silu", "exp2_recip", "approximation", lambda x: x * _exp2_recip_sigmoid(x),
-                "x * reciprocal(1 + exp2(-x log2e)), NX8 e4 between stages",
-                hw="MULT + ACTIVATE.QUANTIZE exp2 + ACTIVATE.QUANTIZE reciprocal"))
+register(Method("silu", "exp2_recip", "approximation", lambda x, fmt="e4": silu_kernel(x, fmt),
+                "kernels/zoo/silu_exp2_recip's dataflow: |x|, exp2(-|x| log2e), 1/(1+e), max(x r, x e r); "
+                "every store NX8 e4", hw="MULT + ACTIVATE.QUANTIZE exp2 + ACTIVATE.QUANTIZE reciprocal"))
+for _f in ("e5", "dynamic"):
+    register(Method("silu", f"exp2_recip_{_f}", "approximation", lambda x, _f=_f: silu_kernel(x, _f),
+                    f"as exp2_recip, every store NX8 {_f}",
+                    hw="MULT + ACTIVATE.QUANTIZE exp2 + ACTIVATE.QUANTIZE reciprocal"))
 register(Method("silu", "hardswish", "estimation", F.hardswish, "x*relu6(x+3)/6 in place of SiLU",
                 hw="ACTIVATE.QUANTIZE relu6 + MULT"))
 register(Method("sigmoid", "exp2_recip", "approximation", _exp2_recip_sigmoid,
@@ -206,19 +250,26 @@ def softmax_exp2(x: torch.Tensor, dim: int, fmt: str | None = "e4") -> torch.Ten
     count: they hold 0 in every stored row, so they never set a row's scale, and their
     probability is 0. Storing them as values would let -3e38 set the scale and flush
     every real score in the row.
+
+    This is kernels/zoo/softmax_exp2_nx8_e4's dataflow, store by store: m = max x
+    (exact: an element of x stored alone); a = hi x - hi m + lo x - lo m in the FP32
+    accumulator (never stored); num = exp2(a) stored; S = sum num (FP32); r = 1 / S
+    stored alone in its row (its own scale: fm + 1 significant bits); y = num r stored.
     """
-    q = (lambda t: quantize(t, fmt, dim)) if fmt else (lambda t: t)
     xf = x.float()
     masked = xf <= -1e30
     zero = torch.zeros_like(xf)
     live = torch.where(masked, torch.full_like(xf, -torch.inf), xf)
     m = live.amax(dim, keepdim=True)
     m = torch.where(torch.isfinite(m), m, zero.sum(dim, keepdim=True))   # an all-masked row
-    z = q(torch.where(masked, zero, (xf - m) * LOG2E))
-    e = q(torch.where(masked, zero, torch.exp2(z)))
-    s = e.sum(dim, keepdim=True)
-    r = torch.reciprocal(s)        # one value per row: a MULT constant, FP32 in R_ACC
-    return q(e * r).to(x.dtype)
+    a = xf * LOG2E_HI
+    a = a - m * LOG2E_HI
+    a = a + xf * LOG2E_LO
+    a = a - m * LOG2E_LO
+    num = _qf(torch.where(masked, zero, _exact32(torch.exp2, torch.where(masked, zero, a))), fmt, dim)
+    s = num.sum(dim, keepdim=True)
+    r = _q_alone(_exact32(torch.reciprocal, s), fmt)
+    return _qf(num * r, fmt, dim).to(x.dtype)
 
 
 register(Method("softmax", "exact", "exact", _softmax_exact, "torch.softmax, FP32",
