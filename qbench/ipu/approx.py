@@ -324,3 +324,31 @@ def op_error(m: Method, n: int = 1 << 16, seed: int = 0) -> dict[str, float]:
         "max_rel": float((err.abs() / ref.double().abs().clamp(min=1e-6)).max()),
         "sqnr_db": float(10 * torch.log10(p / nrm)) if nrm > 0 else float("inf"),
     }
+
+
+#: What the ISA does for each op: "native" = one instruction (or MULT/ACC dataflow) computes
+#: it as defined; "composed" = exact identities of native functions (exp via exp2, softmax,
+#: norms) whose only error is NX8 storage; "none" = no instruction computes it, so every
+#: kernel is an approximation or estimation (or uses the `generic` LUT).
+ISA_SUPPORT: dict[str, tuple[str, str]] = {
+    "relu": ("native", "ACTIVATE.QUANTIZE relu"),
+    "relu6": ("native", "ACTIVATE.QUANTIZE relu6"),
+    "reciprocal": ("native", "ACTIVATE.QUANTIZE reciprocal"),
+    "rsqrt": ("native", "ACTIVATE.QUANTIZE rsqrt"),
+    "matmul": ("native", "MULT + ACC"), "linear": ("native", "MULT + ACC"),
+    "bmm": ("native", "MULT + ACC"), "conv2d": ("native", "MULT + ACC"),
+    "add": ("native", "ACC.ADD"), "mul": ("native", "MULT"), "maxpool2d": ("native", "ACC.MAX / AGG.MAX"),
+    "exp": ("composed", "exp2(x * log2e): MULT + ACTIVATE.QUANTIZE exp2"),
+    "softmax": ("composed", "AGG.MAX, MULT, exp2, AGG.SUM, reciprocal"),
+    "layernorm": ("composed", "MULT/ACC mean and variance, rsqrt (no eps: Q57)"),
+    "rmsnorm": ("composed", "MULT/ACC mean of squares, rsqrt"),
+    "hardswish": ("composed", "relu6 + MULT"), "hardsigmoid": ("composed", "relu6 + MULT"),
+    "sigmoid": ("composed", "reciprocal(1 + exp2(-x log2e)) (needs |x| for exp2's domain)"),
+    "silu": ("composed", "x * sigmoid(x) via exp2 + reciprocal"),
+    "tanh": ("composed", "2 sigmoid(2x) - 1 via exp2 + reciprocal"),
+    "quick_gelu": ("composed", "x * sigmoid(1.702x) via exp2 + reciprocal"),
+    "gelu_tanh": ("composed", "x * sigmoid(2 sqrt(2/pi)(x + 0.044715x^3)) via exp2 + reciprocal"),
+    "gelu": ("none", "no erf: tanh/sigmoid estimation, or the generic LUT"),
+    "mish": ("none", "no log/softplus: generic LUT"), "softplus": ("none", "no log: generic LUT"),
+    "elu": ("composed", "exp2 for x < 0, select by mask"),
+}
