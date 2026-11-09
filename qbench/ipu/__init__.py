@@ -11,16 +11,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from qbench.ipu.approx import CATALOGUE, Method, get, op_error, summary
+from qbench.ipu import candidates
+from qbench.ipu.approx import CATALOGUE, ISA_SUPPORT, Method, get, op_error, summary
 from qbench.ipu.nx8 import Nx8, quantize
 from qbench.ipu.simulator import ApproxSimulator
 
-__all__ = ["CATALOGUE", "ApproxSimulator", "Method", "Nx8", "evaluate_methods", "get", "op_error",
+__all__ = ["CATALOGUE", "ISA_SUPPORT", "ApproxSimulator", "candidates", "Method", "Nx8", "evaluate_methods", "get", "op_error",
            "quantize", "summary"]
 
 
 def evaluate_methods(spec: dict[str, Any], methods: dict[str, str], *, samples: int = 16,
-                     seq_len: int = 256, provider: Any = None) -> dict[str, Any]:
+                     seq_len: int = 256, provider: Any = None, precision: str | None = None,
+                     store_matmul_out: bool = False) -> dict[str, Any]:
     """Accuracy of ``spec``'s model with ``methods`` swapped in, against the exact model.
 
     Returns qbench's evaluation report as a dict, plus ``hits`` (how many calls
@@ -32,10 +34,11 @@ def evaluate_methods(spec: dict[str, Any], methods: dict[str, str], *, samples: 
     provider = provider or hf_provider(spec, samples=samples, seq_len=seq_len)
     reference = provider.build_model()
     provider.evaluation_loader()
-    sim = ApproxSimulator(reference, methods)
+    sim = ApproxSimulator(reference, methods, precision=precision, store_matmul_out=store_matmul_out)
     report = evaluate(reference, sim, provider, EvaluationConfig(metrics="fast", task=provider.task))
     out = report.to_dict()
     out["hits"] = dict(sim.hits)
     out["dataset"] = provider.dataset
     out["task"] = provider.task
+    out["precision"] = precision or "fp32"
     return out
