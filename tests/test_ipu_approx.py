@@ -65,7 +65,7 @@ def test_dynamic_matches_mostly():
     nx8 = _ipu_isa()
     fmt = nx8.Nx8Format(sign=1, exp_format=1, num_bits=8, dynamic=True)
     x = _rows(3)
-    got = quantize(x, "dynamic")
+    got = quantize(x, "dynamic_spec")
     same = 0
     for r in range(x.shape[0]):
         enc = nx8.encode_row([float(v) for v in x[r]], fmt)
@@ -253,17 +253,18 @@ def test_fold_batchnorm_is_exact_in_fp32_and_keeps_the_activation():
     assert m[0].conv.bias is None                        # the simulator folds its own copy
 
 
-def test_dynamic_mse_picks_the_smaller_squared_error_per_row():
+def test_nx8_stores_each_row_in_its_better_encoding():
     import torch
     from qbench.ipu.nx8 import Nx8, quantize
 
-    assert Nx8.parse("dynamic_mse").select == "mse" and Nx8.parse("dynamic").select == "spec"
+    assert Nx8.parse("dynamic").select == "mse" == Nx8.parse("nx8").select
+    assert Nx8.parse("dynamic_spec").select == "spec"
     g = torch.Generator().manual_seed(0)
     x = torch.cat([torch.randn(64, 128, generator=g), torch.randn(64, 128, generator=g) ** 5])
-    q_mse = quantize(x, "dynamic_mse")
+    q_mse = quantize(x, "dynamic")
     e1 = ((quantize(x, "s1e1w8") - x) ** 2).sum(-1)
     e2 = ((quantize(x, "s1e2w8") - x) ** 2).sum(-1)
     got = ((q_mse - x) ** 2).sum(-1)
     torch.testing.assert_close(got, torch.minimum(e1, e2))
-    # never worse than the chip's estimate, row by row
-    assert (got <= ((quantize(x, "dynamic") - x) ** 2).sum(-1) + 1e-12).all()
+    # never worse than the emulator's estimate, row by row
+    assert (got <= ((quantize(x, "dynamic_spec") - x) ** 2).sum(-1) + 1e-12).all()

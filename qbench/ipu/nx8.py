@@ -9,16 +9,15 @@ fields, so it is bit-exact with the emulator on finite inputs and ±inf (saturat
 row scale) for the formats ``tests/test_ipu_approx.py`` checks against ``ipu_isa``:
 signed 8-bit e1-e7 and three unsigned/narrow types. NaN raises, as in the emulator.
 
-A dynamic type chooses each row's format itself, and the rule is part of the type:
+The chip's NX8 type is ``dynamic`` (also ``nx8``): each row is stored in whichever encoding,
+E1M6 or E2M5, has the smaller squared error after rounding, as qbench's CUDA search does
+(``search_best_chunk_format``, metric 0 = L2): the chip's numeric reference. A tie keeps E1M6.
 
-- ``dynamic``: fe = 1 or 2 by the spec's score (§4.3.2.3), as the chip's AAQ stage does,
-  evaluated here in float64 instead of exact fractions (it can differ from the emulator on a
-  tie at the last bit);
-- ``dynamic_mse``: the format with the smaller squared error after rounding, row by row, as
-  qbench's CUDA search does by default (``search_best_chunk_format``, metric 0 = L2), over the
-  same two candidates; a tie keeps fe = 1.
+``dynamic_spec`` is the rule the emulator implements today (§4.3.2.3, an estimate from truncation
+errors, evaluated here in float64: it can differ from the emulator on a tie at the last bit); it
+exists to check kernels bit-exactly against the emulator, not to measure accuracy.
 
-The scale is the same in every type: the row's largest exponent (qbench's ``pow2_floor_nonneg``).
+The scale is the same in both: the row's largest exponent (qbench's ``pow2_floor_nonneg``).
 """
 
 from __future__ import annotations
@@ -39,16 +38,18 @@ class Nx8:
     sign: int = 1
     bits: int = 8
     dynamic: bool = False
-    select: str = "spec"               # dynamic only: "spec" (the chip's §4.3.2.3 score) | "mse" (exact)
+    select: str = "mse"                # dynamic only: "mse" (the reference) | "spec" (the emulator's §4.3.2.3)
 
     @classmethod
     def parse(cls, name: str) -> Nx8:
-        """``e4`` / ``e5`` / ``dynamic`` / ``dynamic_mse`` / ``s1e4w8`` (the ipu-harness variant names)."""
-        name = name.lower().removeprefix("nx8_").removeprefix("nx8-")
-        if name == "dynamic":
-            return cls(fe=1, sign=1, bits=8, dynamic=True)
-        if name == "dynamic_mse":
+        """``dynamic`` / ``nx8`` (the chip's type), ``dynamic_spec`` (the emulator's rule), static ``e4`` /
+        ``s1e4w8`` (the ipu-harness variant names)."""
+        name = name.lower()
+        if name in ("nx8", "dynamic", "dynamic_mse", "nx8_dynamic"):
             return cls(fe=1, sign=1, bits=8, dynamic=True, select="mse")
+        if name in ("dynamic_spec", "nx8_dynamic_spec"):
+            return cls(fe=1, sign=1, bits=8, dynamic=True, select="spec")
+        name = name.removeprefix("nx8_").removeprefix("nx8-")
         if name.startswith("s") and "e" in name and "w" in name:
             s, rest = name[1:].split("e", 1)
             fe, w = rest.split("w", 1)
