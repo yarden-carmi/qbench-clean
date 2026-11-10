@@ -34,6 +34,8 @@ def tensor_metadata(value: torch.Tensor) -> dict[str, Any]:
     if _TRACK_STORAGE.get():
         try:
             meta["storage"] = int(value.untyped_storage().data_ptr())
+            meta["stride"] = [int(x) for x in value.stride()]
+            meta["offset"] = int(value.storage_offset())
         except Exception:  # noqa: BLE001 - a tensor without a storage (a meta or sparse tensor)
             pass
     return meta
