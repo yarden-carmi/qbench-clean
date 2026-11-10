@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextvars
+
 import copy
 import inspect
 import os
@@ -16,14 +18,25 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from .schemas import OperationRecord, Scenario
 
 
+#: Set by capture_scenario(track_storage=True): tensor metadata then names the tensor's storage (its
+#: address, an int: no contents), so a reader can link an op's inputs to the op that wrote them.
+_TRACK_STORAGE: contextvars.ContextVar[bool] = contextvars.ContextVar("qbench_track_storage", default=False)
+
+
 def tensor_metadata(value: torch.Tensor) -> dict[str, Any]:
-    return {
+    meta = {
         "kind": "tensor",
         "shape": [int(dim) for dim in value.shape],
         "dtype": str(value.dtype),
         "device": str(value.device),
         "requires_grad": bool(value.requires_grad),
     }
+    if _TRACK_STORAGE.get():
+        try:
+            meta["storage"] = int(value.untyped_storage().data_ptr())
+        except Exception:  # noqa: BLE001 - a tensor without a storage (a meta or sparse tensor)
+            pass
+    return meta
 
 
 def value_metadata(value: Any, *, depth: int = 0) -> Any:
@@ -433,6 +446,25 @@ def module_ownership(
 
 
 def capture_scenario(
+    model: nn.Module,
+    scenario: Scenario,
+    *,
+    capture_callsites: bool = True,
+    invoked_modules: set[str] | None = None,
+    operation_sink: list[OperationRecord] | None = None,
+    callsite_keys: set[tuple[str, str]] | None = None,
+    track_storage: bool = False,
+) -> tuple[list[OperationRecord], Any]:
+    """``track_storage``: tensor metadata also carries ``storage`` (its address), for data flow."""
+    token = _TRACK_STORAGE.set(track_storage)
+    try:
+        return _capture_scenario(model, scenario, capture_callsites=capture_callsites, invoked_modules=invoked_modules,
+                                 operation_sink=operation_sink, callsite_keys=callsite_keys)
+    finally:
+        _TRACK_STORAGE.reset(token)
+
+
+def _capture_scenario(
     model: nn.Module,
     scenario: Scenario,
     *,
