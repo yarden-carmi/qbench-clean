@@ -251,3 +251,19 @@ def test_fold_batchnorm_is_exact_in_fp32_and_keeps_the_activation():
     sim = ApproxSimulator(m, {"batchnorm": "fold"})
     assert sim.hits["batchnorm"] == 2
     assert m[0].conv.bias is None                        # the simulator folds its own copy
+
+
+def test_dynamic_mse_picks_the_smaller_squared_error_per_row():
+    import torch
+    from qbench.ipu.nx8 import Nx8, quantize
+
+    assert Nx8.parse("dynamic_mse").select == "mse" and Nx8.parse("dynamic").select == "spec"
+    g = torch.Generator().manual_seed(0)
+    x = torch.cat([torch.randn(64, 128, generator=g), torch.randn(64, 128, generator=g) ** 5])
+    q_mse = quantize(x, "dynamic_mse")
+    e1 = ((quantize(x, "s1e1w8") - x) ** 2).sum(-1)
+    e2 = ((quantize(x, "s1e2w8") - x) ** 2).sum(-1)
+    got = ((q_mse - x) ** 2).sum(-1)
+    torch.testing.assert_close(got, torch.minimum(e1, e2))
+    # never worse than the chip's estimate, row by row
+    assert (got <= ((quantize(x, "dynamic") - x) ** 2).sum(-1) + 1e-12).all()

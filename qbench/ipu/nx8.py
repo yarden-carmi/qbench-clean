@@ -9,9 +9,16 @@ fields, so it is bit-exact with the emulator on finite inputs and ±inf (saturat
 row scale) for the formats ``tests/test_ipu_approx.py`` checks against ``ipu_isa``:
 signed 8-bit e1-e7 and three unsigned/narrow types. NaN raises, as in the emulator.
 
-``dynamic`` rows choose fe = 1 or 2 with the spec's score (§4.3.2.3), evaluated
-here in float64 instead of exact fractions: it can differ from the emulator on
-a tie at the last bit.
+A dynamic type chooses each row's format itself, and the rule is part of the type:
+
+- ``dynamic``: fe = 1 or 2 by the spec's score (§4.3.2.3), as the chip's AAQ stage does,
+  evaluated here in float64 instead of exact fractions (it can differ from the emulator on a
+  tie at the last bit);
+- ``dynamic_mse``: the format with the smaller squared error after rounding, row by row, as
+  qbench's CUDA search does by default (``search_best_chunk_format``, metric 0 = L2), over the
+  same two candidates; a tie keeps fe = 1.
+
+The scale is the same in every type: the row's largest exponent (qbench's ``pow2_floor_nonneg``).
 """
 
 from __future__ import annotations
@@ -32,13 +39,16 @@ class Nx8:
     sign: int = 1
     bits: int = 8
     dynamic: bool = False
+    select: str = "spec"               # dynamic only: "spec" (the chip's §4.3.2.3 score) | "mse" (exact)
 
     @classmethod
     def parse(cls, name: str) -> Nx8:
-        """``e4`` / ``e5`` / ``dynamic`` / ``s1e4w8`` (the ipu-harness variant names)."""
+        """``e4`` / ``e5`` / ``dynamic`` / ``dynamic_mse`` / ``s1e4w8`` (the ipu-harness variant names)."""
         name = name.lower().removeprefix("nx8_").removeprefix("nx8-")
         if name == "dynamic":
             return cls(fe=1, sign=1, bits=8, dynamic=True)
+        if name == "dynamic_mse":
+            return cls(fe=1, sign=1, bits=8, dynamic=True, select="mse")
         if name.startswith("s") and "e" in name and "w" in name:
             s, rest = name[1:].split("e", 1)
             fe, w = rest.split("w", 1)
@@ -140,9 +150,16 @@ def quantize(x: torch.Tensor, fmt: Nx8 | str = "e4", dim: int = -1) -> torch.Ten
     # emulator does); padding elements are 0 (exponent 0) and never raise it
     scale = exp.amax(-1, keepdim=True)
     if fmt.dynamic:
-        choice = _dynamic_choice(exp, sig, scale)
         q1 = _quant_rows(sign, exp, sig, scale, 1, 6, 1)
         q2 = _quant_rows(sign, exp, sig, scale, 2, 5, 1)
+        if fmt.select == "mse":
+            ref = torch.where(inf, torch.zeros_like(rows), rows).double()
+            fin = (~inf).double()
+            err1 = (((q1 - ref) * fin) ** 2).sum(-1, keepdim=True)
+            err2 = (((q2 - ref) * fin) ** 2).sum(-1, keepdim=True)
+            choice = (err2 < err1).to(torch.int64)
+        else:
+            choice = _dynamic_choice(exp, sig, scale)
         q = torch.where(choice.bool(), q2, q1)
         fm_row = torch.where(choice.bool(), 5, 6)
     else:
