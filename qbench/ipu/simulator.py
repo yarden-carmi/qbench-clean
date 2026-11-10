@@ -138,6 +138,8 @@ class ApproxSimulator:
         self.store_matmul_out = store_matmul_out
         self.model = copy.deepcopy(model) if copy_model else model
         self.hits: Counter[str] = Counter()
+        if self.methods.get("batchnorm") == "fold":
+            self.hits["batchnorm"] += approx.fold_batchnorm(self.model)
         self._patch_modules()
 
     def method(self, op: str) -> approx.Method:

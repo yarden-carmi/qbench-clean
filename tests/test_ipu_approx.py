@@ -214,3 +214,40 @@ def test_topk_substitute_routes():
     x = torch.randn(8, 16)
     sim = ApproxSimulator(M(), {"topk": "iterative_max"})
     assert torch.equal(sim.run(Scenario("s", (x,))), M()(x)) and sim.hits["topk"] == 1
+
+
+def test_fold_batchnorm_is_exact_in_fp32_and_keeps_the_activation():
+    import copy
+
+    import torch
+    from qbench.ipu import approx
+    from qbench.ipu.simulator import ApproxSimulator
+
+    torch.manual_seed(0)
+
+    class ConvNormAct(torch.nn.Module):
+        def __init__(self, cin, cout):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(cin, cout, 3, padding=1, bias=False)
+            self.bn = torch.nn.BatchNorm2d(cout)
+            self.act = torch.nn.SiLU()
+
+        def forward(self, x):
+            return self.act(self.bn(self.conv(x)))
+
+    m = torch.nn.Sequential(ConvNormAct(3, 8), ConvNormAct(8, 4)).eval()
+    for mod in m.modules():
+        if isinstance(mod, torch.nn.BatchNorm2d):
+            mod.running_mean.uniform_(-1, 1)
+            mod.running_var.uniform_(0.5, 2)
+            mod.weight.data.uniform_(0.5, 1.5)
+            mod.bias.data.uniform_(-0.5, 0.5)
+    x = torch.randn(1, 3, 16, 16)
+    ref = m(x)
+    folded = copy.deepcopy(m)
+    assert approx.fold_batchnorm(folded) == 2
+    assert folded[0].conv.bias is not None
+    torch.testing.assert_close(folded(x), ref, atol=1e-5, rtol=1e-5)
+    sim = ApproxSimulator(m, {"batchnorm": "fold"})
+    assert sim.hits["batchnorm"] == 2
+    assert m[0].conv.bias is None                        # the simulator folds its own copy

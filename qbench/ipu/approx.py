@@ -68,6 +68,47 @@ def get(op: str, name: str) -> Method:
         raise KeyError(f"no method {op}:{name}; known: {known}") from None
 
 
+# --------------------------------------------------------------------------- batch norm
+# Inference batch norm is a fixed per-channel affine (running statistics, any batch size). The
+# emulator's conv kernels fold it into the conv before it: weights scaled by gamma / sqrt(var + eps)
+# offline, the shift becomes the conv's bias. Exact in FP32; in NX8 the folded weights are what is
+# quantized. The simulator applies it to the model (``fold_batchnorm``); ``fn`` is the per-channel
+# affine itself (x, scale [C], shift [C], channels on dim 1).
+def _bn_affine(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    shape = [1, -1] + [1] * (x.dim() - 2)
+    return x * scale.reshape(shape) + shift.reshape(shape)
+
+
+register(Method("batchnorm", "fold", "variation", _bn_affine,
+                "folded into the conv before it: weights scaled by gamma/sqrt(var+eps) offline, the shift is "
+                "the conv's bias (the emulator's conv *_bias kernels)",
+                hw="the conv's MULT + ACC, the accumulator seeded with the bias"))
+
+
+def fold_batchnorm(model: torch.nn.Module) -> int:
+    """Fold every BatchNorm2d that directly follows a Conv2d (consecutive children of one module, same
+    channels, eval mode) into the conv; the norm becomes the identity (an activation it applies stays).
+    Returns how many were folded."""
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+    n = 0
+    for parent in list(model.modules()):
+        prev_name, prev = None, None
+        for name, child in list(parent.named_children()):
+            if isinstance(prev, torch.nn.Conv2d) and isinstance(child, torch.nn.BatchNorm2d) and \
+                    not prev.training and not child.training and child.track_running_stats and \
+                    child.running_mean is not None and prev.out_channels == child.num_features:
+                setattr(parent, prev_name, fuse_conv_bn_eval(prev, child))
+                with torch.no_grad():
+                    child.running_mean.zero_()
+                    child.running_var.fill_(1.0 - child.eps)
+                    if child.affine:
+                        child.weight.fill_(1.0)
+                        child.bias.zero_()
+                n += 1
+            prev_name, prev = name, child
+    return n
+
+
 # --------------------------------------------------------------------------- LUT
 def lut(fn: Callable[[torch.Tensor], torch.Tensor], lo: Callable[[torch.Tensor], torch.Tensor],
         hi: Callable[[torch.Tensor], torch.Tensor], r: float = 8.0, entries: int = 256,
