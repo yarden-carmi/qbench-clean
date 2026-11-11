@@ -268,3 +268,23 @@ def test_nx8_stores_each_row_in_its_better_encoding():
     torch.testing.assert_close(got, torch.minimum(e1, e2))
     # never worse than the emulator's estimate, row by row
     assert (got <= ((quantize(x, "dynamic_spec") - x) ** 2).sum(-1) + 1e-12).all()
+
+
+def test_layer_errors_pair_each_module_with_the_reference():
+    import copy
+    import torch
+    from torch import nn
+    from qbench.ipu import LayerErrors
+    torch.manual_seed(0)
+    ref = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 4))
+    sim = copy.deepcopy(ref)
+    with torch.no_grad():
+        sim[2].weight.add_(0.01)                 # only the last layer differs
+    x = torch.randn(16, 8)
+    with LayerErrors(ref, sim) as le, torch.no_grad():
+        for _ in range(2):                       # a batch: reference, then the simulator
+            ref(x)
+            sim(x)
+    r = le.report()
+    assert r["0"]["sqnr_db"] == float("inf") and r["1"]["sqnr_db"] == float("inf")
+    assert 10 < r["2"]["sqnr_db"] < 80 and r["2"]["max_abs"] > 0 and r["2"]["calls"] == 2
